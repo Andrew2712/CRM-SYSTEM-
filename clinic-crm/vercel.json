@@ -1,0 +1,15 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": ".next",
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/cron/auto-miss",
+      "schedule": "30 2 * * *"
+    },
+    {
+      "path": "/api/cron/waitlist-expire",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}
