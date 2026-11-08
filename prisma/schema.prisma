@@ -1,0 +1,512 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MODELS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(RECEPTIONIST)
+  phone        String?
+  createdAt    DateTime @default(now())
+
+  // ── Soft delete ───────────────────────────────────────────────────────────
+  isActive  Boolean   @default(true)
+  deletedAt DateTime?
+  // ─────────────────────────────────────────────────────────────────────────
+
+  appointments         Appointment[]               @relation("DoctorAppointments")
+  auditLogs            AuditLog[]
+  availability         AvailabilitySlot[]
+  inAppNotifications   InAppNotification[]
+  holidayRequests      HolidayRequest[]            @relation("DoctorHolidayRequests")
+  reassignmentRequests DoctorReassignmentRequest[] @relation("ReassignmentRequester")
+  reassignmentsFrom    DoctorReassignmentRequest[] @relation("ReassignmentFrom")
+  reassignmentsTo      DoctorReassignmentRequest[] @relation("ReassignmentTo")
+  expenses             Expense[]
+  waitlistEntries      Waitlist[]
+  assessments          PatientAssessment[]         @relation("DoctorAssessments")
+
+  // ── NextAuth database sessions (added for server-side revocation) ─────────
+  // Enables force-logout via: prisma.session.deleteMany({ where: { userId } })
+  accounts Account[]
+  sessions Session[]
+  // ─────────────────────────────────────────────────────────────────────────
+}
+
+model Patient {
+  id                   String        @id @default(cuid())
+  patientCode          String        @unique
+  name                 String
+  phone                String        @unique
+  email                String?
+  dob                  DateTime?
+  address              String?
+  status               PatientStatus @default(NEW)
+  createdAt            DateTime      @default(now())
+  age                  Int?
+  gender               Gender?
+  medicalConditions    String?
+  phase                Phase?
+  purposeOfVisit       String?
+  totalSessionsPlanned Int           @default(0)
+  passwordHash         String?
+
+  // ── Soft delete ───────────────────────────────────────────────────────────
+  isActive  Boolean   @default(true)
+  deletedAt DateTime?
+  // ─────────────────────────────────────────────────────────────────────────
+
+  appointments    Appointment[]
+  visits          PatientVisit[]
+  waitlistEntries Waitlist[]
+  assessments     PatientAssessment[]
+  feedbacks       PatientFeedback[]
+
+  @@index([createdAt]) // speeds up "recent patients" ORDER BY createdAt DESC
+}
+
+model Appointment {
+  id              String            @id @default(cuid())
+  patientId       String
+  doctorId        String
+  startTime       DateTime
+  endTime         DateTime
+  status          AppointmentStatus @default(CONFIRMED)
+  sessionType     SessionType
+  rescheduleCount Int               @default(0)
+  createdAt       DateTime          @default(now())
+  notes           String?
+
+  doctor               User                        @relation("DoctorAppointments", fields: [doctorId], references: [id])
+  patient              Patient                     @relation(fields: [patientId], references: [id])
+  notifications        Notification[]
+  visit                PatientVisit?
+  reassignmentRequests DoctorReassignmentRequest[]
+  assessment           PatientAssessment?
+  feedbacks            PatientFeedback[]
+
+  // ── Reminder flags — prevent duplicate sends ──────────────────────────────
+  reminder24hSent Boolean @default(false)
+  reminder2hSent  Boolean @default(false)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // ── Booking-conflict indexes ──────────────────────────────────────────────
+  @@index([doctorId, startTime, endTime])
+  @@index([doctorId, status])
+  // ─────────────────────────────────────────────────────────────────────────
+}
+
+model PatientVisit {
+  id            String            @id @default(cuid())
+  patientId     String
+  doctorId      String
+  appointmentId String            @unique
+  sessionType   SessionType
+  notes         String?
+  status        AppointmentStatus
+  visitDate     DateTime
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id])
+  patient     Patient     @relation(fields: [patientId], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATIENT ASSESSMENT (Vyayāma Assessment Module)
+// ─────────────────────────────────────────────────────────────────────────────
+// Stores the full 9-step MSK assessment completed by the doctor.
+// Key metadata columns allow querying without parsing the JSON blobs.
+// Status lifecycle: DRAFT → PUBLISHED → ARCHIVED
+// Publishing sends an InAppNotification to the patient.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PatientAssessment {
+  id            String  @id @default(cuid())
+  patientId     String? // optional — assessment can be saved without a CRM patient link
+  doctorId      String
+  appointmentId String? @unique // optional link to a specific appointment
+
+  // ── Key metadata — queryable without JSON parsing ─────────────────────────
+  pathway             String? // clinical pathway id, e.g. "sport", "women", "senior" (see src/lib/assessment/pathways.ts)
+  primaryComplaint    String?
+  nrsScore            Int?    // NRS pain score 0–10
+  ndiScore            Int?    // NDI percentage 0–100
+  mobilityScore       Int?    // Mobility score 0–100
+  mobilityGrade       String? // e.g. "A — Excellent"
+  primaryDiagnosis    String? // e.g. "Cervical Radiculopathy"
+  primaryDxIcd        String? // e.g. "M54.12"
+  diagnosisConfidence Int?    // e.g. 80 (percent)
+  irritability        String? // e.g. "Moderate"
+  stage               String? // e.g. "Subacute"
+  loadClassification  String? // e.g. "M3"
+  totalSessions       String? // e.g. "8-12"
+  timelineWeeks       String? // e.g. "6-10"
+  investmentPlan      String? // e.g. "Phase 2 — Build · 12 sessions · ₹11,400"
+  hasRedFlags         Boolean @default(false)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // ── Full blobs ────────────────────────────────────────────────────────────
+  // assessmentData: complete doctor-filled wizard state — see
+  // src/lib/assessment/types.ts (AssessmentState) for the authoritative shape.
+  assessmentData Json
+
+  // aiDiagnosis: output of AI call 1 (runAI diagnosis)
+  //   { dx[], irr, stage, load, prog, yf, flags, rc, movRx, lifeRx,
+  //     plan{p1..p4}, hep[], inv }
+  aiDiagnosis Json?
+
+  // aiDocuments: output of AI call 2 (runAI documents)
+  //   { soap{s,o,a,p}, vm{pi,rca,mp,lp,t3m,cn}, ptR, wa, sc{as,up} }
+  aiDocuments Json?
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
+  status      AssessmentStatus @default(DRAFT)
+  publishedAt DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  // ─────────────────────────────────────────────────────────────────────────
+
+  patient     Patient?     @relation(fields: [patientId], references: [id])
+  doctor      User         @relation("DoctorAssessments", fields: [doctorId], references: [id])
+  appointment Appointment? @relation(fields: [appointmentId], references: [id])
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model AvailabilitySlot {
+  id        String   @id @default(cuid())
+  doctorId  String
+  slotDate  DateTime
+  startTime DateTime
+  endTime   DateTime
+  isBooked  Boolean  @default(false)
+
+  doctor User @relation(fields: [doctorId], references: [id])
+}
+
+model Notification {
+  id            String              @id @default(cuid())
+  appointmentId String
+  channel       NotificationChannel
+  scheduledAt   DateTime
+  sentAt        DateTime?
+  status        NotificationStatus  @default(PENDING)
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id])
+}
+
+model InAppNotification {
+  id        String         @id @default(cuid())
+  userId    String
+  type      InAppNotifType
+  title     String
+  body      String
+  read      Boolean        @default(false)
+  entityId  String?
+  createdAt DateTime       @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+model HolidayRequest {
+  id        String               @id @default(cuid())
+  doctorId  String
+  date      DateTime
+  reason    String
+  status    HolidayRequestStatus @default(PENDING)
+  createdAt DateTime             @default(now())
+
+  doctor User @relation("DoctorHolidayRequests", fields: [doctorId], references: [id])
+}
+
+model DoctorReassignmentRequest {
+  id                String             @id @default(cuid())
+  appointmentId     String
+  requestedByUserId String
+  fromDoctorId      String
+  toDoctorId        String
+  status            ReassignmentStatus @default(PENDING)
+  notes             String?
+  createdAt         DateTime           @default(now())
+
+  appointment Appointment @relation(fields: [appointmentId], references: [id])
+  requestedBy User        @relation("ReassignmentRequester", fields: [requestedByUserId], references: [id])
+  fromDoctor  User        @relation("ReassignmentFrom", fields: [fromDoctorId], references: [id])
+  toDoctor    User        @relation("ReassignmentTo", fields: [toDoctorId], references: [id])
+}
+
+model Waitlist {
+  id            String         @id @default(cuid())
+  patientId     String
+  doctorId      String
+  preferredDate DateTime
+  preferredTime String?
+  status        WaitlistStatus @default(PENDING)
+  priority      Int            @default(0)
+  notes         String?
+  notifiedAt    DateTime?
+  expiresAt     DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  patient Patient @relation(fields: [patientId], references: [id])
+  doctor  User    @relation(fields: [doctorId], references: [id])
+
+  @@index([doctorId, status, preferredDate])
+  @@index([patientId])
+  @@index([status])
+}
+
+model Expense {
+  id          String          @id @default(cuid())
+  title       String
+  description String?
+  category    ExpenseCategory
+  amount      Float
+  expenseDate DateTime
+  paymentMode PaymentMode
+  isDeleted   Boolean         @default(false)
+  deletedAt   DateTime?
+  createdById String
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  createdBy User @relation(fields: [createdById], references: [id])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PATIENT FEEDBACK
+// ─────────────────────────────────────────────────────────────────────────────
+// Submitted by patients from the patient portal.
+// Captures overall text feedback + before/after pain scale (0-10).
+// Visible to ADMIN and DOCTOR via /dashboard/feedback.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PatientFeedback {
+  id              String   @id @default(cuid())
+  patientId       String
+  appointmentId   String?  // optional link to a specific appointment
+  overallFeedback String   // free-text overall experience feedback
+  painBefore      Int      // NRS 0-10 pain BEFORE the session
+  painAfter       Int      // NRS 0-10 pain AFTER the session
+  createdAt       DateTime @default(now())
+
+  patient     Patient      @relation(fields: [patientId], references: [id])
+  appointment Appointment? @relation(fields: [appointmentId], references: [id])
+
+  @@index([patientId])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id          String      @id @default(cuid())
+  userId      String
+  userName    String
+  userRole    String
+  action      AuditAction
+  entity      String
+  entityId    String
+  description String
+  oldValue    Json?
+  newValue    Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime    @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEXTAUTH DATABASE SESSION MODELS
+// Required by @auth/prisma-adapter (strategy: "database").
+// Enables server-side session revocation:
+//   await prisma.session.deleteMany({ where: { userId } })
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  DOCTOR
+  RECEPTIONIST
+  PATIENT
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum Phase {
+  PHASE_1
+  PHASE_2
+  PHASE_3
+  PHASE_4
+  PHASE_5
+}
+
+enum PatientStatus {
+  NEW
+  RETURNING
+}
+
+enum AppointmentStatus {
+  CONFIRMED
+  ATTENDED
+  MISSED
+  CANCELLED
+  RESCHEDULED
+}
+
+enum SessionType {
+  INITIAL_ASSESSMENT
+  FOLLOW_UP
+  SPECIALIZED
+}
+
+enum NotificationChannel {
+  EMAIL
+  WHATSAPP
+  CALENDAR
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum InAppNotifType {
+  APPOINTMENT_CREATED
+  APPOINTMENT_MISSED
+  SESSION_COMPLETED
+  SYSTEM
+  APPOINTMENT_CANCELLED
+  APPOINTMENT_RESCHEDULED
+  DOCTOR_REASSIGNED
+  HOLIDAY_REQUEST
+  REASSIGNMENT_REQUEST
+  WAITLIST_SLOT_AVAILABLE
+  WAITLIST_BOOKED
+  WAITLIST_EXPIRED
+  ASSESSMENT_CREATED
+  ASSESSMENT_PUBLISHED
+  FEEDBACK_SUBMITTED
+}
+
+enum HolidayRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ReassignmentStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+enum WaitlistStatus {
+  PENDING
+  NOTIFIED
+  ACCEPTED
+  EXPIRED
+  CANCELLED
+}
+
+enum ExpenseCategory {
+  SALARY
+  RENT
+  ELECTRICITY
+  INTERNET
+  EQUIPMENT
+  MEDICINE
+  MAINTENANCE
+  MARKETING
+  TRANSPORT
+  OTHER
+}
+
+enum PaymentMode {
+  CASH
+  UPI
+  CARD
+  BANK_TRANSFER
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  EXPORT
+  PASSWORD_RESET
+  ROLE_CHANGE
+}
+
+enum AssessmentStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}

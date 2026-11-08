@@ -1,0 +1,68 @@
+# .github/workflows/reminder-cron.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Hourly cron job — calls the Vyayama Physio reminder endpoint.
+#
+# PRODUCTION FIX: APP_URL was previously hardcoded to a Vercel preview URL.
+# It is now read from a GitHub Actions secret (APP_URL) so the workflow works
+# across environments without touching this file.
+#
+# Setup (one-time):
+#   1. Repo → Settings → Secrets and variables → Actions → New repository secret
+#   2. Add: CRON_SECRET  = (same value as your Vercel CRON_SECRET env var)
+#   3. Add: APP_URL      = https://your-production-domain.vercel.app
+#   4. Set the same CRON_SECRET in Vercel Dashboard → Settings → Env Variables
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Appointment Reminder Cron
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # Every hour at :00 — catches both 24h and 2h windows
+
+  # Allow manual trigger from GitHub UI for testing
+  workflow_dispatch:
+
+jobs:
+  send-reminders:
+    name: Trigger Reminder API
+    runs-on: ubuntu-latest
+    timeout-minutes: 5         # Kill if hanging — cron should complete in <60s
+
+    steps:
+      - name: Validate secrets are set
+        run: |
+          if [ -z "${{ secrets.CRON_SECRET }}" ]; then
+            echo "❌ CRON_SECRET secret is not set in GitHub Actions"
+            exit 1
+          fi
+          if [ -z "${{ secrets.APP_URL }}" ]; then
+            echo "❌ APP_URL secret is not set in GitHub Actions"
+            exit 1
+          fi
+          echo "✅ Secrets are configured"
+
+      - name: Call reminder endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          APP_URL: ${{ secrets.APP_URL }}
+        run: |
+          echo "Triggering reminder cron at $(date -u) → $APP_URL"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X GET \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            --max-time 90 \
+            "$APP_URL/api/cron/reminders")
+
+          HTTP_BODY=$(echo "$RESPONSE" | head -n -1)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response:    $HTTP_BODY"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Cron endpoint returned $HTTP_CODE — marking run as failed"
+            exit 1
+          fi
+
+          echo "✅ Reminder cron completed successfully"
